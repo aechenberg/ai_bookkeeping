@@ -11,15 +11,21 @@ const APP_BASE_URL = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
 const CLIENT_ID = process.env.INTUIT_CLIENT_ID;
 const CLIENT_SECRET = process.env.INTUIT_CLIENT_SECRET;
 const REDIRECT_URI = process.env.INTUIT_REDIRECT_URI || `${APP_BASE_URL}/oauth/callback`;
-const API_HOST = process.env.INTUIT_API_HOST || 'https://sandbox-quickbooks.api.intuit.com';
 const SCOPES = (process.env.INTUIT_SCOPES || 'com.intuit.quickbooks.accounting').trim();
 
-const AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
-const TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
-const REVOKE_URL = `${API_HOST}/v2/oauth2/tokens/revoke`;
+const DISCOVERY_URL = 'https://developer.api.intuit.com/.well-known/openid_configuration';
+const FALLBACK_ENDPOINTS = {
+  authorization_endpoint: 'https://appcenter.intuit.com/connect/oauth2',
+  token_endpoint: 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer',
+  revocation_endpoint: 'https://developer.api.intuit.com/v2/oauth2/tokens/revoke'
+};
 
-let oauthState = null;
+const OAUTH_PENDING_TTL_MS = 10 * 60 * 1000;
+
+let oauthPending = null;
 let tokenStore = null;
+let discoveryCache = null;
+let discoveryCacheAt = 0;
 
 function ensureConfig(res) {
   if (!CLIENT_ID || !CLIENT_SECRET) {
@@ -31,6 +37,55 @@ function ensureConfig(res) {
 
 function base64Credentials(clientId, clientSecret) {
   return Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+}
+
+function base64UrlEncode(input) {
+  return Buffer.from(input)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function createCodeVerifier() {
+  return base64UrlEncode(crypto.randomBytes(64));
+}
+
+function createCodeChallenge(verifier) {
+  const digest = crypto.createHash('sha256').update(verifier).digest();
+  return base64UrlEncode(digest);
+}
+
+async function getIntuitEndpoints() {
+  if (discoveryCache && Date.now() - discoveryCacheAt < 10 * 60 * 1000) {
+    return discoveryCache;
+  }
+
+  try {
+    const response = await fetch(DISCOVERY_URL, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      return FALLBACK_ENDPOINTS;
+    }
+
+    const json = await response.json();
+    const endpoints = {
+      authorization_endpoint: json.authorization_endpoint || FALLBACK_ENDPOINTS.authorization_endpoint,
+      token_endpoint: json.token_endpoint || FALLBACK_ENDPOINTS.token_endpoint,
+      revocation_endpoint: json.revocation_endpoint || FALLBACK_ENDPOINTS.revocation_endpoint
+    };
+
+    discoveryCache = endpoints;
+    discoveryCacheAt = Date.now();
+    return endpoints;
+  } catch (_error) {
+    return FALLBACK_ENDPOINTS;
+  }
 }
 
 app.get('/', (_req, res) => {
@@ -48,20 +103,30 @@ app.get('/', (_req, res) => {
 </html>`);
 });
 
-app.get('/connect', (req, res) => {
+app.get('/connect', async (req, res) => {
   if (!ensureConfig(res)) {
     return;
   }
 
-  const state = crypto.randomBytes(16).toString('hex');
-  oauthState = state;
+  const state = crypto.randomBytes(32).toString('hex');
+  const codeVerifier = createCodeVerifier();
+  const codeChallenge = createCodeChallenge(codeVerifier);
+  const endpoints = await getIntuitEndpoints();
 
-  const authorizeUrl = new URL(AUTHORIZE_URL);
+  oauthPending = {
+    state,
+    codeVerifier,
+    createdAt: Date.now()
+  };
+
+  const authorizeUrl = new URL(endpoints.authorization_endpoint);
   authorizeUrl.searchParams.set('client_id', CLIENT_ID);
   authorizeUrl.searchParams.set('response_type', 'code');
   authorizeUrl.searchParams.set('scope', SCOPES);
   authorizeUrl.searchParams.set('redirect_uri', REDIRECT_URI);
   authorizeUrl.searchParams.set('state', state);
+  authorizeUrl.searchParams.set('code_challenge', codeChallenge);
+  authorizeUrl.searchParams.set('code_challenge_method', 'S256');
 
   if (req.query.realmId) {
     authorizeUrl.searchParams.set('realmId', String(req.query.realmId));
@@ -77,8 +142,14 @@ app.get('/oauth/callback', async (req, res) => {
 
   const { state, code, realmId } = req.query;
 
-  if (!state || String(state) !== oauthState) {
+  if (!oauthPending || !state || String(state) !== oauthPending.state) {
     res.status(400).send('Invalid OAuth state.');
+    return;
+  }
+
+  if (Date.now() - oauthPending.createdAt > OAUTH_PENDING_TTL_MS) {
+    oauthPending = null;
+    res.status(400).send('OAuth state expired. Start again from /connect.');
     return;
   }
 
@@ -87,14 +158,19 @@ app.get('/oauth/callback', async (req, res) => {
     return;
   }
 
+  const { codeVerifier } = oauthPending;
+  oauthPending = null;
+
   try {
+    const endpoints = await getIntuitEndpoints();
     const body = new URLSearchParams({
       grant_type: 'authorization_code',
       code: String(code),
-      redirect_uri: REDIRECT_URI
+      redirect_uri: REDIRECT_URI,
+      code_verifier: codeVerifier
     });
 
-    const tokenResponse = await fetch(TOKEN_URL, {
+    const tokenResponse = await fetch(endpoints.token_endpoint, {
       method: 'POST',
       headers: {
         Accept: 'application/json',
@@ -115,8 +191,6 @@ app.get('/oauth/callback', async (req, res) => {
       realmId: realmId ? String(realmId) : undefined,
       ...tokenJson
     };
-
-    oauthState = null;
 
     res.type('html').send(`<!doctype html>
 <html>
@@ -146,7 +220,8 @@ app.get('/disconnect', async (_req, res) => {
   }
 
   try {
-    const revokeResponse = await fetch(REVOKE_URL, {
+    const endpoints = await getIntuitEndpoints();
+    const revokeResponse = await fetch(endpoints.revocation_endpoint, {
       method: 'POST',
       headers: {
         Accept: 'application/json',
