@@ -1,5 +1,6 @@
 const express = require('express');
 const crypto = require('crypto');
+const { execSync } = require('child_process');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -12,6 +13,25 @@ const CLIENT_ID = process.env.INTUIT_CLIENT_ID;
 const CLIENT_SECRET = process.env.INTUIT_CLIENT_SECRET;
 const REDIRECT_URI = process.env.INTUIT_REDIRECT_URI || `${APP_BASE_URL}/oauth/callback`;
 const SCOPES = (process.env.INTUIT_SCOPES || 'com.intuit.quickbooks.accounting').trim();
+
+function resolveVersion() {
+  if (process.env.APP_VERSION) {
+    return process.env.APP_VERSION;
+  }
+  if (process.env.GIT_COMMIT) {
+    return process.env.GIT_COMMIT;
+  }
+
+  try {
+    return execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString()
+      .trim();
+  } catch (_error) {
+    return 'unknown';
+  }
+}
+
+const APP_VERSION = resolveVersion();
 
 const DISCOVERY_URL = 'https://developer.api.intuit.com/.well-known/openid_configuration';
 const FALLBACK_ENDPOINTS = {
@@ -101,6 +121,15 @@ app.get('/', (_req, res) => {
     </ul>
   </body>
 </html>`);
+});
+
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    version: APP_VERSION,
+    service: 'ai-bookkeeping',
+    internalOnly: true
+  });
 });
 
 app.get('/connect', async (req, res) => {
@@ -255,5 +284,5 @@ app.get('/disconnect', async (_req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`AI Bookkeeping approval app listening on ${APP_BASE_URL} (port ${PORT})`);
+  console.log(`AI Bookkeeping approval app listening on ${APP_BASE_URL} (port ${PORT}, version ${APP_VERSION})`);
 });

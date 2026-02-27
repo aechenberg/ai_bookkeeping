@@ -8,6 +8,7 @@ This repo includes a minimal Node/Express app to satisfy Intuit production appro
 - `/connect` → Starts Intuit OAuth flow
 - `/oauth/callback` → Handles OAuth redirect and token exchange
 - `/disconnect` → Revokes token using Intuit revocation endpoint
+- `/health` → Returns running version/build info to verify deployment state
 
 ## 1) Configure environment
 
@@ -23,6 +24,10 @@ Required values:
 - `INTUIT_CLIENT_SECRET`
 - `APP_BASE_URL` (e.g. `https://bookkeeping.yourdomain.com`)
 - `INTUIT_REDIRECT_URI` (e.g. `https://bookkeeping.yourdomain.com/oauth/callback`)
+
+Optional:
+
+- `APP_VERSION` (set to commit SHA or release tag for easy runtime verification)
 
 ## 2) Run locally
 
