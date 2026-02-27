@@ -88,7 +88,7 @@ Environment=NODE_ENV=production
 EnvironmentFile=/workspaces/ai_bookkeeping/.env
 ExecStart=/usr/bin/node /workspaces/ai_bookkeeping/server.js
 Restart=always
-User=ubuntu
+User=user
 
 [Install]
 WantedBy=multi-user.target
